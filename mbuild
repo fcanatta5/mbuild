@@ -7,6 +7,9 @@ IFS=$'\n\t'
 MBUILD_VERSION="0.0.1"
 MBUILD_ARCH_EXPECTED="x86_64"
 
+# Verbosity: 0=quiet,1=normal,2=debug
+MBUILD_VERBOSE="${MBUILD_VERBOSE:-1}"
+
 # =========================
 # Default paths (overridable in /etc/mbuild.conf)
 # =========================
@@ -39,9 +42,32 @@ log() {
     # log LEVEL MESSAGE...
     # LEVEL: INFO, WARN, ERROR, DEBUG
     local level="$1"; shift || true
+
+    # Filter by verbosity:
+    #   ERROR/WARN: always shown
+    #   INFO: shown if MBUILD_VERBOSE >= 1
+    #   DEBUG: shown if MBUILD_VERBOSE >= 2
+    case "$level" in
+        ERROR|WARN)
+            ;;
+        INFO)
+            if [ "${MBUILD_VERBOSE:-1}" -lt 1 ]; then
+                return 0
+            fi
+            ;;
+        DEBUG)
+            if [ "${MBUILD_VERBOSE:-1}" -lt 2 ]; then
+                return 0
+            fi
+            ;;
+        *)
+            ;;
+    esac
+
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown-time")"
-    printf '%s [%s] %s\n' "$timestamp" "$level" "$*" >&2
+    printf '%s [%s] %s
+' "$timestamp" "$level" "$*" >&2
 }
 
 die() {
@@ -66,11 +92,29 @@ ensure_root() {
 }
 
 check_arch() {
-    local arch
+    local arch expected
     arch="$(uname -m 2>/dev/null || echo unknown)"
-    if [ "$arch" != "$MBUILD_ARCH_EXPECTED" ]; then
-        die 1 "Unsupported architecture: $arch (expected ${MBUILD_ARCH_EXPECTED})"
-    fi
+
+    # Allow MBUILD_ARCH_EXPECTED to contain one or more architectures (space-separated).
+    for expected in $MBUILD_ARCH_EXPECTED; do
+        if [ "$arch" = "$expected" ]; then
+            return 0
+        fi
+    done
+
+    die 1 "Unsupported architecture: $arch (expected one of: $MBUILD_ARCH_EXPECTED)"
+}
+
+check_core_tools() {
+    # Verify presence of core external tools used by mbuild
+    require_cmd tar
+    require_cmd find
+    require_cmd mkdir
+    require_cmd cp
+    require_cmd rm
+    require_cmd rmdir
+    require_cmd make
+    require_cmd tac
 }
 
 safe_mkdir() {
@@ -313,6 +357,14 @@ load_pkgfile() {
         style="autotools"
     fi
 
+    case "$style" in
+        autotools|gnu-toolchain|custom)
+            ;;
+        *)
+            die 1 "Unsupported build style '$style' in pkgfile: $file"
+            ;;
+    esac
+
     # Defaults if not set in pkg
     prefix="${prefix:-/usr}"
     sysconfdir="${sysconfdir:-/etc}"
@@ -370,9 +422,10 @@ download_source() {
 cmd_fetch() {
     # mbuild fetch NAME VERSION URL
     ensure_root
-    check_arch
     load_config
+    check_arch
     ensure_dirs
+    check_core_tools
 
     if [ "$#" -ne 3 ]; then
         die 1 "Usage: mbuild fetch <name> <version> <url>"
@@ -389,9 +442,10 @@ cmd_fetch() {
 cmd_fetch_verify() {
     # mbuild fetch-verify NAME VERSION URL SHA256
     ensure_root
-    check_arch
     load_config
+    check_arch
     ensure_dirs
+    check_core_tools
 
     if [ "$#" -ne 4 ]; then
         die 1 "Usage: mbuild fetch-verify <name> <version> <url> <sha256>"
@@ -653,10 +707,9 @@ install_from_destdir() {
 
     log "INFO" "Installing ${name}-${version} from destdir into root ${MBUILD_ROOT}..."
 
-    (
-        cd "$destdir" || exit 1
-        find . -mindepth 1 -print0
-    ) | while IFS= read -r -d '' rel; do
+    # Use process substitution instead of a pipeline so that errors in the loop
+    # (including die) terminate the main shell rather than a subshell.
+    while IFS= read -r -d '' rel; do
         local relpath="${rel#./}"
         if [ -z "$relpath" ]; then
             continue
@@ -678,7 +731,7 @@ install_from_destdir() {
             cp -a "$src" "$dst" || die 1 "Failed to install file: $dst"
             printf '%s\n' "$relpath" >>"$files_list.tmp" || die 1 "Failed to record file: $relpath"
         fi
-    done
+    done < <( cd "$destdir" && find . -mindepth 1 -print0 )
 
     mv -f "$files_list.tmp" "$files_list" || die 1 "Failed to move files list into place."
 
@@ -691,18 +744,20 @@ install_from_destdir() {
 
 cmd_init() {
     ensure_root
-    check_arch
     load_config
+    check_arch
     ensure_dirs
+    check_core_tools
     log "INFO" "mbuild initialized."
 }
 
 cmd_build_only() {
     # mbuild build <category> <name> <version> [tarball-path]
     ensure_root
-    check_arch
     load_config
+    check_arch
     ensure_dirs
+    check_core_tools
 
     if [ "$#" < 3 ] || [ "$#" -gt 4 ]; then
         die 1 "Usage: mbuild build <category> <name> <version> [tarball-path]"
@@ -734,9 +789,10 @@ cmd_build_only() {
 cmd_install() {
     # mbuild install <category> <name> [version]
     ensure_root
-    check_arch
     load_config
+    check_arch
     ensure_dirs
+    check_core_tools
 
     if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
         die 1 "Usage: mbuild install <category> <name> [version]"
@@ -774,6 +830,7 @@ cmd_install() {
 cmd_list() {
     load_config
     ensure_dirs
+    check_core_tools
 
     printf 'Installed packages (according to mbuild):\n'
     if ! ls "$MBUILD_DB_PACKAGES_DIR"/*.meta >/dev/null 2>&1; then
@@ -793,6 +850,9 @@ cmd_info() {
     if [ "$#" -ne 1 ]; then
         die 1 "Usage: mbuild info <name>"
     fi
+    load_config
+    ensure_dirs
+    check_core_tools
     local pkgname="$1"
     local meta
     meta="$(pkg_meta_path "$pkgname")"
@@ -824,6 +884,7 @@ cmd_remove() {
     ensure_root
     load_config
     ensure_dirs
+    check_core_tools
     local pkgname="$1"
     local meta
     meta="$(pkg_meta_path "$pkgname")"
@@ -839,21 +900,38 @@ cmd_remove() {
 
     if [ -f "$files_list_path" ]; then
         log "INFO" "Removing files for package ${pkgname}..."
-        tac "$files_list_path" | while IFS= read -r relpath; do
+        local had_errors=0
+
+        # Read the files list in reverse order but keep the loop in the main shell
+        while IFS= read -r relpath; do
             [ -n "$relpath" ] || continue
             local target="${MBUILD_ROOT}/${relpath}"
             if [ "${relpath%/}" != "$relpath" ]; then
                 target="${MBUILD_ROOT}/${relpath%/}"
                 if [ -d "$target" ]; then
-                    rmdir "$target" 2>/dev/null || true
+                    if ! rmdir "$target" 2>/dev/null; then
+                        log "WARN" "Directory not empty or failed to remove: $target"
+                        had_errors=1
+                    fi
                 fi
             else
                 if [ -e "$target" ] || [ -L "$target" ]; then
-                    rm -f -- "$target" || log "WARN" "Failed to remove: $target"
+                    if ! rm -f -- "$target"; then
+                        log "WARN" "Failed to remove: $target"
+                        had_errors=1
+                    fi
                 fi
             fi
-        done
-        rm -f -- "$files_list_path" || log "WARN" "Failed to remove files list: $files_list_path"
+        done < <(tac "$files_list_path")
+
+        if ! rm -f -- "$files_list_path"; then
+            log "WARN" "Failed to remove files list: $files_list_path"
+            had_errors=1
+        fi
+
+        if [ "$had_errors" -ne 0 ]; then
+            die 1 "Removal incomplete for package ${pkgname}; some files or directories may remain."
+        fi
     else
         log "WARN" "No files list found for ${pkgname}; only metadata will be removed."
     fi
@@ -936,6 +1014,47 @@ EOF
 }
 
 main() {
+    if [ "$#" -lt 1 ]; then
+        print_help
+        exit 1
+    fi
+
+    # Global options before the command:
+    #   -v/--verbose : more detailed logging
+    #   -q/--quiet   : only warnings and errors
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -v|--verbose)
+                MBUILD_VERBOSE=2
+                shift
+                ;;
+            -q|--quiet)
+                MBUILD_VERBOSE=0
+                shift
+                ;;
+            --help|-h)
+                print_help
+                exit 0
+                ;;
+            --version)
+                print_version
+                exit 0
+                ;;
+            --)
+                shift
+                break
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                print_help
+                exit 1
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+
     if [ "$#" -lt 1 ]; then
         print_help
         exit 1
