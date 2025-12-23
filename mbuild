@@ -1,0 +1,983 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+IFS=$'\n\t'
+
+MBUILD_VERSION="0.0.1"
+MBUILD_ARCH_EXPECTED="x86_64"
+
+# =========================
+# Default paths (overridable in /etc/mbuild.conf)
+# =========================
+
+MBUILD_ROOT="/"
+MBUILD_DB_DIR="/var/lib/mbuild"
+MBUILD_BUILD_DIR="/var/cache/mbuild/build"
+MBUILD_SRC_DIR="/var/cache/mbuild/src"
+MBUILD_DESTDIR_BASE="/var/cache/mbuild/dest"
+MBUILD_LOG_DIR="/var/log/mbuild"
+MBUILD_CONF="/etc/mbuild.conf"
+
+# Recipe tree:
+#   ${MBUILD_RECIPE_ROOT}/<category>/<name>/
+#       patch/*.patch
+#       files/...
+MBUILD_RECIPE_ROOT="/usr/share/mbuild/recipes"
+
+# Package metadata tree:
+#   ${MBUILD_PKG_ROOT}/<category>/<name>.pkg
+MBUILD_PKG_ROOT="/usr/share/mbuild/pkg"
+
+MBUILD_DB_PACKAGES_DIR="${MBUILD_DB_DIR}/packages"
+
+# =========================
+# Utility functions
+# =========================
+
+log() {
+    # log LEVEL MESSAGE...
+    # LEVEL: INFO, WARN, ERROR, DEBUG
+    local level="$1"; shift || true
+    local timestamp
+    timestamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown-time")"
+    printf '%s [%s] %s\n' "$timestamp" "$level" "$*" >&2
+}
+
+die() {
+    # die EXIT_CODE MESSAGE...
+    local code="$1"; shift || true
+    log "ERROR" "$*"
+    exit "$code"
+}
+
+require_cmd() {
+    # require_cmd cmd-name
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        die 127 "Required command not found: $cmd"
+    fi
+}
+
+ensure_root() {
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+        die 1 "This action must be run as root."
+    fi
+}
+
+check_arch() {
+    local arch
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+    if [ "$arch" != "$MBUILD_ARCH_EXPECTED" ]; then
+        die 1 "Unsupported architecture: $arch (expected ${MBUILD_ARCH_EXPECTED})"
+    fi
+}
+
+safe_mkdir() {
+    # safe_mkdir DIR
+    local dir="$1"
+    if [ -z "$dir" ] || [ "$dir" = "/" ]; then
+        die 1 "Refusing to create empty or root directory."
+    fi
+    if [ ! -d "$dir" ]; then
+        mkdir -p "$dir" || die 1 "Failed to create directory: $dir"
+    fi
+}
+
+safe_touch() {
+    local file="$1"
+    local dir
+    dir="$(dirname -- "$file")"
+    safe_mkdir "$dir"
+    if [ ! -e "$file" ]; then
+        : > "$file" || die 1 "Failed to create file: $file"
+    fi
+}
+
+compute_sha256() {
+    # compute_sha256 FILE
+    require_cmd sha256sum
+    local file="$1"
+    sha256sum "$file" 2>/dev/null | awk '{print $1}'
+}
+
+verify_sha256() {
+    # verify_sha256 FILE EXPECTED
+    local file="$1"
+    local expected="$2"
+    if [ -z "$expected" ]; then
+        die 1 "Empty checksum passed to verify_sha256."
+    fi
+    if [ ! -f "$file" ]; then
+        die 1 "File not found for checksum verification: $file"
+    fi
+    local got
+    got="$(compute_sha256 "$file")"
+    if [ "$got" != "$expected" ]; then
+        die 1 "Checksum mismatch for $file: expected $expected, got $got"
+    fi
+    log "INFO" "Checksum OK for $file"
+}
+
+# =========================
+# Configuration handling
+# =========================
+
+load_config() {
+    if [ -f "$MBUILD_CONF" ]; then
+        # shellcheck disable=SC1090
+        . "$MBUILD_CONF"
+    fi
+}
+
+ensure_dirs() {
+    safe_mkdir "$MBUILD_DB_DIR"
+    safe_mkdir "$MBUILD_DB_PACKAGES_DIR"
+    safe_mkdir "$MBUILD_BUILD_DIR"
+    safe_mkdir "$MBUILD_SRC_DIR"
+    safe_mkdir "$MBUILD_DESTDIR_BASE"
+    safe_mkdir "$MBUILD_LOG_DIR"
+}
+
+# =========================
+# Database helpers
+# =========================
+
+pkg_meta_path() {
+    # pkg_meta_path NAME
+    local name="$1"
+    printf '%s/%s.meta' "$MBUILD_DB_PACKAGES_DIR" "$name"
+}
+
+pkg_files_path() {
+    # pkg_files_path NAME
+    local name="$1"
+    printf '%s/%s.files' "$MBUILD_DB_PACKAGES_DIR" "$name"
+}
+
+pkg_record() {
+    # pkg_record NAME VERSION CATEGORY TARBALL CHECKSUM BUILD_LOG DESTDIR FILES_LIST PKGFILE
+    local name="$1"
+    local version="$2"
+    local category="$3"
+    local tarball="$4"
+    local checksum="$5"
+    local build_log="$6"
+    local destdir="$7"
+    local files_list="$8"
+    local pkgfile="$9"
+    local meta
+    meta="$(pkg_meta_path "$name")"
+    safe_touch "$meta"
+    {
+        printf 'name=%s\n' "$name"
+        printf 'version=%s\n' "$version"
+        printf 'category=%s\n' "$category"
+        printf 'tarball=%s\n' "$tarball"
+        printf 'checksum=%s\n' "$checksum"
+        printf 'build_log=%s\n' "$build_log"
+        printf 'destdir=%s\n' "$destdir"
+        printf 'files_list=%s\n' "$files_list"
+        printf 'pkgfile=%s\n' "$pkgfile"
+        printf 'installed_at=%s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+    } >"$meta.tmp" || die 1 "Failed to write meta file: $meta.tmp"
+    mv -f "$meta.tmp" "$meta" || die 1 "Failed to move meta file into place: $meta"
+}
+
+# =========================
+# Recipe helpers
+# =========================
+
+recipe_base_dir() {
+    # recipe_base_dir CATEGORY NAME
+    local category="$1"
+    local name="$2"
+    printf '%s/%s/%s' "$MBUILD_RECIPE_ROOT" "$category" "$name"
+}
+
+recipe_patch_dir() {
+    local category="$1"
+    local name="$2"
+    printf '%s/patch' "$(recipe_base_dir "$category" "$name")"
+}
+
+recipe_files_dir() {
+    local category="$1"
+    local name="$2"
+    printf '%s/files' "$(recipe_base_dir "$category" "$name")"
+}
+
+apply_patches_if_any() {
+    local category="$1"
+    local name="$2"
+    local workdir="$3"
+
+    local pdir
+    pdir="$(recipe_patch_dir "$category" "$name")"
+
+    if [ ! -d "$pdir" ]; then
+        log "INFO" "No patches directory for ${category}/${name}, skipping patches."
+        return 0
+    fi
+
+    require_cmd patch
+
+    (
+        shopt -s nullglob
+        local patches=("$pdir"/*.patch)
+        if [ "${#patches[@]}" -eq 0 ]; then
+            log "INFO" "Patches directory exists but no .patch files for ${category}/${name}."
+            exit 0
+        fi
+
+        log "INFO" "Applying patches for ${category}/${name}..."
+        local patchfile
+        for patchfile in "${patches[@]}"; do
+            log "INFO" "  Applying patch: $(basename -- "$patchfile")"
+            ( cd "$workdir" && patch -p1 < "$patchfile" ) || die 1 "Failed to apply patch: $patchfile"
+        done
+    )
+}
+
+overlay_recipe_files_into_destdir() {
+    local category="$1"
+    local name="$2"
+    local destdir="$3"
+
+    local fdir
+    fdir="$(recipe_files_dir "$category" "$name")"
+
+    if [ ! -d "$fdir" ]; then
+        log "INFO" "No files directory for ${category}/${name}, skipping extra files."
+        return 0
+    fi
+
+    log "INFO" "Overlaying recipe files into destdir for ${category}/${name}..."
+    require_cmd cp
+    ( cd "$fdir" && cp -a . "$destdir" ) || die 1 "Failed to copy recipe files into destdir."
+}
+
+# =========================
+# .pkg metadata helpers
+# =========================
+
+pkgfile_path() {
+    # pkgfile_path CATEGORY NAME
+    local category="$1"
+    local name="$2"
+    printf '%s/%s/%s.pkg' "$MBUILD_PKG_ROOT" "$category" "$name"
+}
+
+load_pkgfile() {
+    # load_pkgfile CATEGORY NAME
+    local category="$1"
+    local name="$2"
+
+    local file
+    file="$(pkgfile_path "$category" "$name")"
+    if [ ! -f "$file" ]; then
+        die 1 "Package metadata file not found: $file"
+    fi
+
+    # Reset key variables to avoid leakage from previous pkg
+    unset version release description homepage license
+    unset source sha256 source_subdir style
+    unset build_deps run_deps
+    unset prefix sysconfdir datadir
+    unset cflags cxxflags ldflags
+    unset configure_flags make_flags make_install_flags
+    unset target
+    unset build_env runtime_env
+    unset patches
+
+    # shellcheck disable=SC1090
+    . "$file"
+
+    # Basic sanity checks
+    if [ -z "${name:-}" ]; then
+        die 1 "Missing 'name' in pkgfile: $file"
+    fi
+    if [ -z "${category:-}" ]; then
+        die 1 "Missing 'category' in pkgfile: $file"
+    fi
+    if [ -z "${version:-}" ]; then
+        die 1 "Missing 'version' in pkgfile: $file"
+    fi
+    if [ -z "${source:-}" ]; then
+        die 1 "Missing 'source' in pkgfile: $file"
+    fi
+    if [ -z "${sha256:-}" ]; then
+        die 1 "Missing 'sha256' in pkgfile: $file"
+    fi
+    if [ -z "${style:-}" ]; then
+        style="autotools"
+    fi
+
+    # Defaults if not set in pkg
+    prefix="${prefix:-/usr}"
+    sysconfdir="${sysconfdir:-/etc}"
+    datadir="${datadir:-/usr/share}"
+    cflags="${cflags:-}"
+    cxxflags="${cxxflags:-}"
+    ldflags="${ldflags:-}"
+}
+
+# =========================
+# Downloader / source cache
+# =========================
+
+detect_downloader() {
+    if command -v curl >/dev/null 2>&1; then
+        echo "curl"
+        return 0
+    fi
+    if command -v wget >/dev/null 2>&1; then
+        echo "wget"
+        return 0
+    fi
+    die 1 "Neither curl nor wget found; cannot download sources."
+}
+
+download_source() {
+    # download_source URL DEST
+    local url="$1"
+    local dest="$2"
+
+    local downloader
+    downloader="$(detect_downloader)"
+
+    if [ -f "$dest" ]; then
+        log "INFO" "Using cached source tarball: $dest"
+        return 0
+    fi
+
+    log "INFO" "Fetching source from ${url}..."
+    case "$downloader" in
+        curl)
+            curl -L -o "$dest" "$url" || die 1 "Download failed with curl."
+            ;;
+        wget)
+            wget -O "$dest" "$url" || die 1 "Download failed with wget."
+            ;;
+        *)
+            die 1 "Unexpected downloader: $downloader"
+            ;;
+    esac
+
+    log "INFO" "Source saved to: $dest"
+}
+
+cmd_fetch() {
+    # mbuild fetch NAME VERSION URL
+    ensure_root
+    check_arch
+    load_config
+    ensure_dirs
+
+    if [ "$#" -ne 3 ]; then
+        die 1 "Usage: mbuild fetch <name> <version> <url>"
+    fi
+
+    local url="$3"
+    local tarball
+    tarball="$(basename -- "$url")"
+    local dest="${MBUILD_SRC_DIR}/${tarball}"
+
+    download_source "$url" "$dest"
+}
+
+cmd_fetch_verify() {
+    # mbuild fetch-verify NAME VERSION URL SHA256
+    ensure_root
+    check_arch
+    load_config
+    ensure_dirs
+
+    if [ "$#" -ne 4 ]; then
+        die 1 "Usage: mbuild fetch-verify <name> <version> <url> <sha256>"
+    fi
+
+    local url="$3"
+    local checksum="$4"
+
+    local tarball
+    tarball="$(basename -- "$url")"
+    local dest="${MBUILD_SRC_DIR}/${tarball}"
+
+    download_source "$url" "$dest"
+    verify_sha256 "$dest" "$checksum"
+}
+
+# =========================
+# Style engines (intelligent build logic)
+# =========================
+
+setup_build_env_from_pkg() {
+    if [ -n "${cflags:-}" ]; then
+        export CFLAGS="$cflags"
+    fi
+    if [ -n "${cxxflags:-}" ]; then
+        export CXXFLAGS="$cxxflags"
+    fi
+    if [ -n "${ldflags:-}" ]; then
+        export LDFLAGS="$ldflags"
+    fi
+    if [ -n "${build_env:-}" ]; then
+        local pair
+        for pair in $build_env; do
+            export "$pair"
+        done
+    fi
+}
+
+style_autotools_build() {
+    # style_autotools_build SRC_DIR BUILD_ROOT DESTDIR
+    local src_dir="$1"
+    local build_root="$2"
+    local destdir="$3"
+
+    local bdir="${build_root}/build-autotools"
+    safe_mkdir "$bdir"
+    cd "$bdir"
+
+    local cfg
+    if [ -x "$src_dir/configure" ]; then
+        cfg="$src_dir/configure"
+    else
+        cfg="./configure"
+    fi
+
+    local args=()
+    args+=("--prefix=${prefix}")
+    args+=("--sysconfdir=${sysconfdir}")
+    args+=("--datadir=${datadir}")
+
+    if [ -n "${configure_flags:-}" ]; then
+        # shellcheck disable=SC2206
+        local extra_cfg=($configure_flags)
+        args+=("${extra_cfg[@]}")
+    fi
+
+    echo "+ ${cfg} ${args[*]}"
+    "$cfg" "${args[@]}"
+
+    local mk_flags=()
+    if [ -n "${make_flags:-}" ]; then
+        # shellcheck disable=SC2206
+        mk_flags=($make_flags)
+    fi
+
+    echo
+    echo "+ make ${mk_flags[*]}"
+    make "${mk_flags[@]}"
+
+    local inst_flags=()
+    if [ -n "${make_install_flags:-}" ]; then
+        # shellcheck disable=SC2206
+        inst_flags=($make_install_flags)
+    fi
+
+    echo
+    echo "+ make DESTDIR=${destdir} install ${inst_flags[*]}"
+    make DESTDIR="${destdir}" install "${inst_flags[@]}"
+
+    echo
+    echo "Autotools build finished."
+}
+
+style_gnu_toolchain_build() {
+    # style_gnu_toolchain_build SRC_DIR BUILD_ROOT DESTDIR
+    local src_dir="$1"
+    local build_root="$2"
+    local destdir="$3"
+
+    local bdir="${build_root}/build-gnu-toolchain"
+    safe_mkdir "$bdir"
+    cd "$bdir"
+
+    local cfg="${src_dir}/configure"
+    local tgt="${target:-x86_64-pc-linux-gnu}"
+
+    local args=()
+    args+=("--prefix=${prefix}")
+    args+=("--target=${tgt}")
+    args+=("--sysconfdir=${sysconfdir}")
+    args+=("--datadir=${datadir}")
+
+    if [ -n "${configure_flags:-}" ]; then
+        # shellcheck disable=SC2206
+        local extra_cfg=($configure_flags)
+        args+=("${extra_cfg[@]}")
+    fi
+
+    echo "+ ${cfg} ${args[*]}"
+    "$cfg" "${args[@]}"
+
+    local mk_flags=()
+    if [ -n "${make_flags:-}" ]; then
+        # shellcheck disable=SC2206
+        mk_flags=($make_flags)
+    fi
+
+    echo
+    echo "+ make ${mk_flags[*]}"
+    make "${mk_flags[@]}"
+
+    local inst_flags=()
+    if [ -n "${make_install_flags:-}" ]; then
+        # shellcheck disable=SC2206
+        inst_flags=($make_install_flags)
+    fi
+
+    echo
+    echo "+ make DESTDIR=${destdir} install ${inst_flags[*]}"
+    make DESTDIR="${destdir}" install "${inst_flags[@]}"
+
+    echo
+    echo "GNU toolchain style build finished."
+}
+
+style_custom_build() {
+    # style_custom_build CATEGORY NAME SRC_DIR BUILD_ROOT DESTDIR
+    local category="$1"
+    local name="$2"
+    local src_dir="$3"
+    local build_root="$4"
+    local destdir="$5"
+
+    local hook
+    hook="$(recipe_base_dir "$category" "$name")/build.sh"
+    if [ ! -x "$hook" ]; then
+        die 1 "Custom style selected but build.sh not found or not executable: $hook"
+    fi
+
+    echo "+ custom build script: $hook"
+    "$hook" "$src_dir" "$build_root" "$destdir" "$name" "$version" "$category"
+}
+
+# =========================
+# Core build/install helpers
+# =========================
+
+build_from_pkg_metadata() {
+    # build_from_pkg_metadata CATEGORY NAME TARBALL_PATH DESTDIR BUILD_LOG
+    local category="$1"
+    local name="$2"
+    local tarball_path="$3"
+    local destdir="$4"
+    local build_log="$5"
+
+    if [ ! -f "$tarball_path" ]; then
+        die 1 "Tarball not found: $tarball_path"
+    fi
+
+    local build_dir="${MBUILD_BUILD_DIR}/${name}-${version}"
+
+    if [ -d "$build_dir" ]; then
+        log "WARN" "Removing existing build directory: $build_dir"
+        rm -rf -- "$build_dir" || die 1 "Failed to remove old build directory."
+    fi
+    if [ -d "$destdir" ]; then
+        log "WARN" "Removing existing destdir: $destdir"
+        rm -rf -- "$destdir" || die 1 "Failed to remove old destdir."
+    fi
+
+    safe_mkdir "$build_dir"
+    safe_mkdir "$destdir"
+
+    log "INFO" "Extracting ${tarball_path} into ${build_dir}..."
+    require_cmd tar
+    tar -xf "$tarball_path" -C "$build_dir" || die 1 "Failed to extract tarball."
+
+    local workdir="$build_dir"
+    if [ -n "${source_subdir:-}" ] && [ -d "$build_dir/$source_subdir" ]; then
+        workdir="$build_dir/$source_subdir"
+    else
+        local src_subdir
+        src_subdir="$(tar -tf "$tarball_path" 2>/dev/null | head -n1 | cut -d/ -f1 || true)"
+        if [ -n "$src_subdir" ] && [ -d "$build_dir/$src_subdir" ]; then
+            workdir="$build_dir/$src_subdir"
+        fi
+    fi
+
+    log "INFO" "Starting build in ${workdir}..."
+    : > "$build_log" || die 1 "Failed to create build log: $build_log"
+
+    setup_build_env_from_pkg
+    apply_patches_if_any "$category" "$name" "$workdir"
+
+    {
+        echo "=== mbuild build log for ${name}-${version} (${style}) ==="
+        echo "Started at: $(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+        echo
+
+        case "$style" in
+            autotools)
+                style_autotools_build "$workdir" "$build_dir" "$destdir"
+                ;;
+            gnu_toolchain)
+                style_gnu_toolchain_build "$workdir" "$build_dir" "$destdir"
+                ;;
+            custom)
+                style_custom_build "$category" "$name" "$workdir" "$build_dir" "$destdir"
+                ;;
+            *)
+                echo "Unknown style: $style"
+                exit 1
+                ;;
+        esac
+
+    } >>"$build_log" 2>&1 || {
+        log "ERROR" "Build failed for ${name}-${version}. See log: ${build_log}"
+        exit 1
+    }
+
+    overlay_recipe_files_into_destdir "$category" "$name" "$destdir"
+
+    log "INFO" "Build and destdir installation finished successfully for ${name}-${version}."
+}
+
+install_from_destdir() {
+    # install_from_destdir NAME VERSION DESTDIR FILES_LIST
+    local name="$1"
+    local version="$2"
+    local destdir="$3"
+    local files_list="$4"
+
+    if [ ! -d "$destdir" ]; then
+        die 1 "Destdir not found for installation: $destdir"
+    fi
+
+    safe_mkdir "$(dirname -- "$files_list")"
+    : > "$files_list.tmp" || die 1 "Failed to create files list: $files_list.tmp"
+
+    log "INFO" "Installing ${name}-${version} from destdir into root ${MBUILD_ROOT}..."
+
+    (
+        cd "$destdir" || exit 1
+        find . -mindepth 1 -print0
+    ) | while IFS= read -r -d '' rel; do
+        local relpath="${rel#./}"
+        if [ -z "$relpath" ]; then
+            continue
+        fi
+        local src="${destdir}/${relpath}"
+        local dst="${MBUILD_ROOT}/${relpath}"
+
+        local dstdir
+        dstdir="$(dirname -- "$dst")"
+        safe_mkdir "$dstdir"
+
+        if [ -d "$src" ] && [ ! -L "$src" ]; then
+            if [ ! -d "$dst" ]; then
+                mkdir -p "$dst" || die 1 "Failed to create directory: $dst"
+            fi
+            printf '%s/\n' "$relpath" >>"$files_list.tmp" || die 1 "Failed to record directory: $relpath"
+        else
+            require_cmd cp
+            cp -a "$src" "$dst" || die 1 "Failed to install file: $dst"
+            printf '%s\n' "$relpath" >>"$files_list.tmp" || die 1 "Failed to record file: $relpath"
+        fi
+    done
+
+    mv -f "$files_list.tmp" "$files_list" || die 1 "Failed to move files list into place."
+
+    log "INFO" "Installation completed for ${name}-${version}."
+}
+
+# =========================
+# Commands
+# =========================
+
+cmd_init() {
+    ensure_root
+    check_arch
+    load_config
+    ensure_dirs
+    log "INFO" "mbuild initialized."
+}
+
+cmd_build_only() {
+    # mbuild build <category> <name> <version> [tarball-path]
+    ensure_root
+    check_arch
+    load_config
+    ensure_dirs
+
+    if [ "$#" < 3 ] || [ "$#" -gt 4 ]; then
+        die 1 "Usage: mbuild build <category> <name> <version> [tarball-path]"
+    fi
+
+    local category="$1"
+    local name="$2"
+    local version_arg="$3"
+    local tarball_path="${4:-}"
+
+    load_pkgfile "$category" "$name"
+    version="$version_arg"
+
+    if [ -z "$tarball_path" ]; then
+        local tarball
+        tarball="$(basename -- "$source")"
+        tarball_path="${MBUILD_SRC_DIR}/${tarball}"
+        download_source "$source" "$tarball_path"
+        verify_sha256 "$tarball_path" "$sha256"
+    fi
+
+    local destdir="${MBUILD_DESTDIR_BASE}/${name}-${version}"
+    local build_log="${MBUILD_LOG_DIR}/${name}-${version}.build.log"
+
+    build_from_pkg_metadata "$category" "$name" "$tarball_path" "$destdir" "$build_log"
+    log "INFO" "Build-only finished. Destdir at: $destdir"
+}
+
+cmd_install() {
+    # mbuild install <category> <name> [version]
+    ensure_root
+    check_arch
+    load_config
+    ensure_dirs
+
+    if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+        die 1 "Usage: mbuild install <category> <name> [version]"
+    fi
+
+    local category="$1"
+    local name="$2"
+    local version_override="${3:-}"
+
+    load_pkgfile "$category" "$name"
+
+    if [ -n "$version_override" ]; then
+        version="$version_override"
+    fi
+
+    local tarball
+    tarball="$(basename -- "$source")"
+    local tarball_path="${MBUILD_SRC_DIR}/${tarball}"
+
+    download_source "$source" "$tarball_path"
+    verify_sha256 "$tarball_path" "$sha256"
+
+    local destdir="${MBUILD_DESTDIR_BASE}/${name}-${version}"
+    local build_log="${MBUILD_LOG_DIR}/${name}-${version}.build.log"
+    local files_list
+    files_list="$(pkg_files_path "$name")"
+    local pkgfile
+    pkgfile="$(pkgfile_path "$category" "$name")"
+
+    build_from_pkg_metadata "$category" "$name" "$tarball_path" "$destdir" "$build_log"
+    install_from_destdir "$name" "$version" "$destdir" "$files_list"
+    pkg_record "$name" "$version" "$category" "$tarball_path" "$sha256" "$build_log" "$destdir" "$files_list" "$pkgfile"
+}
+
+cmd_list() {
+    load_config
+    ensure_dirs
+
+    printf 'Installed packages (according to mbuild):\n'
+    if ! ls "$MBUILD_DB_PACKAGES_DIR"/*.meta >/dev/null 2>&1; then
+        printf '  (none)\n'
+        return 0
+    fi
+
+    local meta
+    for meta in "$MBUILD_DB_PACKAGES_DIR"/*.meta; do
+        # shellcheck disable=SC1090
+        . "$meta"
+        printf '  - %s %s [%s]\n' "${name:-unknown}" "${version:-unknown}" "${category:-unknown}"
+    done
+}
+
+cmd_info() {
+    if [ "$#" -ne 1 ]; then
+        die 1 "Usage: mbuild info <name>"
+    fi
+    local pkgname="$1"
+    local meta
+    meta="$(pkg_meta_path "$pkgname")"
+
+    if [ ! -f "$meta" ]; then
+        die 1 "Package not found in mbuild database: $pkgname"
+    fi
+
+    # shellcheck disable=SC1090
+    . "$meta"
+
+    printf 'name: %s\n' "${name:-unknown}"
+    printf 'version: %s\n' "${version:-unknown}"
+    printf 'category: %s\n' "${category:-unknown}"
+    printf 'tarball: %s\n' "${tarball:-unknown}"
+    printf 'checksum: %s\n' "${checksum:-unknown}"
+    printf 'build_log: %s\n' "${build_log:-unknown}"
+    printf 'destdir: %s\n' "${destdir:-unknown}"
+    printf 'files_list: %s\n' "${files_list:-unknown}"
+    printf 'pkgfile: %s\n' "${pkgfile:-unknown}"
+    printf 'installed_at: %s\n' "${installed_at:-unknown}"
+}
+
+cmd_remove() {
+    # mbuild remove <name>
+    if [ "$#" -ne 1 ]; then
+        die 1 "Usage: mbuild remove <name>"
+    fi
+    ensure_root
+    load_config
+    ensure_dirs
+    local pkgname="$1"
+    local meta
+    meta="$(pkg_meta_path "$pkgname")"
+
+    if [ ! -f "$meta" ]; then
+        die 1 "Package not recorded in mbuild database: $pkgname"
+    fi
+
+    # shellcheck disable=SC1090
+    . "$meta"
+
+    local files_list_path="${files_list:-$(pkg_files_path "$pkgname")}"
+
+    if [ -f "$files_list_path" ]; then
+        log "INFO" "Removing files for package ${pkgname}..."
+        tac "$files_list_path" | while IFS= read -r relpath; do
+            [ -n "$relpath" ] || continue
+            local target="${MBUILD_ROOT}/${relpath}"
+            if [ "${relpath%/}" != "$relpath" ]; then
+                target="${MBUILD_ROOT}/${relpath%/}"
+                if [ -d "$target" ]; then
+                    rmdir "$target" 2>/dev/null || true
+                fi
+            else
+                if [ -e "$target" ] || [ -L "$target" ]; then
+                    rm -f -- "$target" || log "WARN" "Failed to remove: $target"
+                fi
+            fi
+        done
+        rm -f -- "$files_list_path" || log "WARN" "Failed to remove files list: $files_list_path"
+    else
+        log "WARN" "No files list found for ${pkgname}; only metadata will be removed."
+    fi
+
+    if [ -n "${destdir:-}" ] && [ -d "${destdir:-}" ]; then
+        log "INFO" "Removing destdir: ${destdir}"
+        rm -rf -- "${destdir}" || log "WARN" "Failed to remove destdir: ${destdir}"
+    fi
+
+    rm -f -- "$meta" || die 1 "Failed to remove meta file: $meta"
+    log "INFO" "Package ${pkgname} removed."
+}
+
+print_version() {
+    printf 'mbuild %s\n' "$MBUILD_VERSION"
+}
+
+print_help() {
+    cat <<EOF
+mbuild - intelligent source-based package manager skeleton
+
+Usage:
+  mbuild init
+      Initialize directories and verify environment.
+
+  mbuild fetch <name> <version> <url>
+      Download a source tarball into the mbuild source cache (no checksum).
+
+  mbuild fetch-verify <name> <version> <url> <sha256>
+      Download a source tarball into the source cache and verify checksum.
+
+  mbuild build <category> <name> <version> [tarball-path]
+      Build and install into DESTDIR only (no final system installation).
+      Uses pkg metadata to decide style and flags.
+      If tarball-path is omitted, source and checksum are read from the pkg.
+
+  mbuild install <category> <name> [version]
+      Fetch (if needed), verify checksum, build, install into DESTDIR,
+      then install into system root and register package.
+      Version defaults to the one in the pkgfile if omitted.
+
+  mbuild list
+      List packages known to the mbuild database.
+
+  mbuild info <name>
+      Show metadata about a package.
+
+  mbuild remove <name>
+      Remove a package: uninstall files and metadata.
+
+  mbuild version
+      Show mbuild version.
+
+  mbuild help
+      Show this help message.
+
+Metadata layout (MBUILD_PKG_ROOT):
+  \${MBUILD_PKG_ROOT}/<category>/<name>.pkg
+
+Recipe layout (MBUILD_RECIPE_ROOT):
+  \${MBUILD_RECIPE_ROOT}/<category>/<name>/
+      build.sh         (optional, used for style=custom)
+      patch/*.patch    (applied automatically in build step)
+      files/...        (copied automatically into DESTDIR, then installed)
+
+Configuration:
+  Default configuration file: /etc/mbuild.conf
+
+  You can override base variables in that file, for example:
+      MBUILD_DB_DIR="/var/lib/mbuild"
+      MBUILD_BUILD_DIR="/var/cache/mbuild/build"
+      MBUILD_SRC_DIR="/var/cache/mbuild/src"
+      MBUILD_DESTDIR_BASE="/var/cache/mbuild/dest"
+      MBUILD_LOG_DIR="/var/log/mbuild"
+      MBUILD_RECIPE_ROOT="/usr/share/mbuild/recipes"
+      MBUILD_PKG_ROOT="/usr/share/mbuild/pkg"
+      MBUILD_ROOT="/"
+
+EOF
+}
+
+main() {
+    if [ "$#" -lt 1 ]; then
+        print_help
+        exit 1
+    fi
+
+    local cmd="$1"; shift || true
+
+    case "$cmd" in
+        init)
+            cmd_init "$@"
+            ;;
+        fetch)
+            cmd_fetch "$@"
+            ;;
+        fetch-verify)
+            cmd_fetch_verify "$@"
+            ;;
+        build)
+            cmd_build_only "$@"
+            ;;
+        install)
+            cmd_install "$@"
+            ;;
+        list)
+            cmd_list "$@"
+            ;;
+        info)
+            cmd_info "$@"
+            ;;
+        remove)
+            cmd_remove "$@"
+            ;;
+        version)
+            print_version
+            ;;
+        help|-h|--help)
+            print_help
+            ;;
+        *)
+            die 1 "Unknown command: $cmd"
+            ;;
+    esac
+}
+
+main "$@"
