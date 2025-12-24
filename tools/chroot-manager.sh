@@ -13,10 +13,10 @@ IFS=$'\n\t'
 #######################################
 
 # Diretório raiz do chroot (deve existir e ter uma base de sistema instalada)
-CHROOT_ROOT="/srv/chroot/debian"
+CHROOT_ROOT="/mnt/mbuild/rootfs"
 
 # Nome lógico do chroot (usado apenas para logs/prompt)
-CHROOT_NAME="debian-sandbox"
+CHROOT_NAME="myos"
 
 # Usuário padrão dentro do chroot (normalmente root)
 CHROOT_DEFAULT_USER="root"
@@ -60,8 +60,17 @@ log() {
     local level="$1"; shift || true
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "unknown-time")"
-    printf '%s [%s] %s\n' "$timestamp" "$level" "$*" >&2
+    local line
+    line="$(printf '%s [%s] %s\n' "$timestamp" "$level" "$*")"
+    # sempre loga para stderr
+    printf '%s\n' "$line" >&2
+    # também tenta registrar em arquivo de log, se configurado
+    if [ -n "${CHROOT_LOG_DIR:-}" ]; then
+        mkdir -p -- "$CHROOT_LOG_DIR" 2>/dev/null || true
+        printf '%s\n' "$line" >> "${CHROOT_LOG_DIR}/chroot-manager.log" 2>/dev/null || true
+    fi
 }
+
 
 die() {
     # die EXIT_CODE MESSAGE...
@@ -77,6 +86,19 @@ require_cmd() {
     fi
 }
 
+check_requirements() {
+    # Valida a presença de comandos externos necessários
+    require_cmd mount
+    require_cmd umount
+    require_cmd chroot
+    require_cmd grep
+    require_cmd sed
+    require_cmd cp
+    require_cmd bash
+    require_cmd su
+}
+
+
 require_root() {
     if [ "${EUID:-$(id -u)}" -ne 0 ]; then
         die 1 "Este script precisa ser executado como root."
@@ -89,7 +111,7 @@ ensure_dirs() {
 }
 
 sanity_check_root() {
-    # Não permitir "/" e coisas perigosas como "/root", "/home" etc. sem confirmação.
+    # Valida CHROOT_ROOT para evitar diretórios perigosos do host.
     if [ -z "$CHROOT_ROOT" ]; then
         die 1 "CHROOT_ROOT não definido."
     fi
@@ -97,11 +119,15 @@ sanity_check_root() {
         "/"|"")
             die 1 "CHROOT_ROOT não pode ser /"
             ;;
+        "/root"|"/home"|"/tmp"|"/var"|"/usr"|"/opt")
+            die 1 "CHROOT_ROOT não pode ser um diretório crítico do host: $CHROOT_ROOT"
+            ;;
     esac
     if [ ! -d "$CHROOT_ROOT" ]; then
         die 1 "Diretório do chroot não existe: $CHROOT_ROOT"
     fi
 }
+
 
 is_mounted() {
     # is_mounted PATH -> true/false
@@ -115,16 +141,45 @@ is_mounted() {
     grep -qE "[[:space:]]$(printf '%s' "$path" | sed 's,/,\\/,g')[[:space:]]" /proc/mounts
 }
 
+CHROOT_EPHEMERAL=0
+
 lock_chroot() {
+    # Implementa um lock simples baseado em arquivo com PID
     if [ -e "$CHROOT_LOCK_FILE" ]; then
-        log "WARN" "Lock encontrado em $CHROOT_LOCK_FILE – outro processo pode estar usando o chroot."
+        local existing_pid
+        existing_pid="$(cat "$CHROOT_LOCK_FILE" 2>/dev/null || echo "")"
+        if [ -n "$existing_pid" ] && [ -d "/proc/$existing_pid" ] && [ "$existing_pid" != "$$" ]; then
+            die 1 "Chroot já está em uso por outro processo (PID $existing_pid)."
+        else
+            log "WARN" "Lockfile obsoleto encontrado em $CHROOT_LOCK_FILE; sobrescrevendo."
+        fi
     fi
-    : > "$CHROOT_LOCK_FILE" || die 1 "Não foi possível criar lockfile $CHROOT_LOCK_FILE"
+    echo "$$" > "$CHROOT_LOCK_FILE" || die 1 "Não foi possível criar lockfile $CHROOT_LOCK_FILE"
 }
 
 unlock_chroot() {
-    rm -f -- "$CHROOT_LOCK_FILE" 2>/dev/null || true
+    if [ -f "$CHROOT_LOCK_FILE" ]; then
+        local owner_pid
+        owner_pid="$(cat "$CHROOT_LOCK_FILE" 2>/dev/null || echo "")"
+        if [ -n "$owner_pid" ] && [ "$owner_pid" != "$$" ] && [ -d "/proc/$owner_pid" ]; then
+            log "WARN" "Lock em $CHROOT_LOCK_FILE pertence a outro processo (PID $owner_pid); não será removido."
+            return 0
+        fi
+        rm -f -- "$CHROOT_LOCK_FILE" 2>/dev/null || log "WARN" "Falha ao remover lockfile $CHROOT_LOCK_FILE"
+    fi
 }
+
+cleanup() {
+    # Rotina de limpeza automática usada em traps
+    if [ "${CHROOT_EPHEMERAL:-0}" -eq 1 ]; then
+        log "DEBUG" "Executando cleanup automático (teardown_chroot_mounts + unlock_chroot)."
+        teardown_chroot_mounts || true
+        unlock_chroot || true
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
 
 #######################################
 # MONTAGENS
@@ -276,6 +331,29 @@ enter_chroot_shell() {
     # OBS: chroot não é isolamento total de segurança – comentário explícito
     log "WARN" "Lembre-se: chroot não oferece isolamento de segurança forte como contêiner/VM."
 
+    if [ "$user" = "root" ]; then
+        chroot "$CHROOT_ROOT" /usr/bin/env -i \
+            HOME="/root" \
+            TERM="${TERM:-xterm-256color}" \
+            PATH="$CHROOT_DEFAULT_PATH" \
+            PS1="${CHROOT_PROMPT_PREFIX}\u@\h:\w\\$ " \
+            /bin/bash -l
+    else
+        chroot "$CHROOT_ROOT" /usr/bin/env -i \
+            HOME="/home/$user" \
+            TERM="${TERM:-xterm-256color}" \
+            PATH="$CHROOT_DEFAULT_PATH" \
+            PS1="${CHROOT_PROMPT_PREFIX}\u@\h:\w\\$ " \
+            /bin/bash -lc "if id \"$user\" >/dev/null 2>&1; then exec su - \"$user\"; else echo \"Usuário '$user' não existe dentro do chroot\" >&2; exec bash -l; fi"
+    fi
+}
+"
+
+    log "INFO" "Entrando em shell interativa no chroot ${CHROOT_NAME} como usuário ${user}"
+
+    # OBS: chroot não é isolamento total de segurança – comentário explícito
+    log "WARN" "Lembre-se: chroot não oferece isolamento de segurança forte como contêiner/VM."
+
     # Ajusta variáveis de ambiente mínimas
     chroot "$CHROOT_ROOT" /usr/bin/env -i \
         HOME="/root" \
@@ -286,11 +364,37 @@ enter_chroot_shell() {
 }
 
 run_in_chroot() {
+    if [ "$#" -lt 2 ]; then
+        die 1 "Uso interno incorreto: run_in_chroot <user> <comando...>"
+    fi
+
+    local user="$1"; shift
     if [ "$#" -lt 1 ]; then
         die 1 "Nenhum comando fornecido para execução no chroot."
     fi
-    local cmd=("$@")
-    log "INFO" "Executando no chroot ${CHROOT_NAME}: ${cmd[*]}"
+
+    local cmd_script=""
+    local part
+    for part in "$@"; do
+        cmd_script+=" $(printf '%q' "$part")"
+    done
+
+    log "INFO" "Executando no chroot ${CHROOT_NAME} como usuário '${user}':${cmd_script}"
+
+    local shell_script
+    if [ "$user" = "root" ]; then
+        shell_script="$cmd_script"
+    else
+        shell_script="if id \"$user\" >/dev/null 2>&1; then exec su - \"$user\" -c $(printf '%q' "$cmd_script"); else echo \"Usuário '$user' não existe dentro do chroot\" >&2; exit 1; fi"
+    fi
+
+    chroot "$CHROOT_ROOT" /usr/bin/env -i \
+        HOME="/root" \
+        TERM="${TERM:-xterm-256color}" \
+        PATH="$CHROOT_DEFAULT_PATH" \
+        /bin/bash -c "$shell_script"
+}
+: ${cmd[*]}"
 
     chroot "$CHROOT_ROOT" /usr/bin/env -i \
         HOME="/root" \
@@ -339,56 +443,81 @@ show_status() {
 #######################################
 
 cmd_prepare() {
-    require_root
-    ensure_dirs
-    sanity_check_root
     lock_chroot
     setup_chroot_mounts
-    log "INFO" "Chroot ${CHROOT_NAME} preparado."
+    copy_resolv_conf
+    log "INFO" "Chroot ${CHROOT_NAME} preparado. Use '$0 shell' ou '$0 run' para utilizar e '$0 stop' para desmontar."
+}
+ preparado."
 }
 
 cmd_shell() {
-    require_root
-    ensure_dirs
-    sanity_check_root
+    CHROOT_EPHEMERAL=1
     lock_chroot
     setup_chroot_mounts
     enter_chroot_shell "${1:-$CHROOT_DEFAULT_USER}"
+    teardown_chroot_mounts
+    unlock_chroot
+    CHROOT_EPHEMERAL=0
+}
+"
 }
 
 cmd_run() {
-    require_root
-    ensure_dirs
-    sanity_check_root
+    local run_user="root"
+
+    if [ "${1-}" = "--user" ] || [ "${1-}" = "-u" ]; then
+        if [ "$#" -lt 3 ]; then
+            die 1 "Uso: $0 run [-u|--user USER] comando [args...]"
+        fi
+        run_user="$2"
+        shift 2
+    fi
+
+    if [ "$#" -lt 1 ]; then
+        die 1 "Nenhum comando fornecido para execução no chroot."
+    fi
+
+    CHROOT_EPHEMERAL=1
     lock_chroot
     setup_chroot_mounts
-    shift || true
-    run_in_chroot "$@"
+    run_in_chroot "$run_user" "$@"
+    teardown_chroot_mounts
+    unlock_chroot
+    CHROOT_EPHEMERAL=0
 }
 
+
 cmd_stop() {
-    require_root
-    ensure_dirs
-    sanity_check_root
     teardown_chroot_mounts
     unlock_chroot
     log "INFO" "Chroot ${CHROOT_NAME} parado (montagens desmontadas)."
 }
+ parado (montagens desmontadas)."
+}
 
 cmd_status() {
-    require_root
-    ensure_dirs
-    sanity_check_root
     show_status
 }
+
 
 print_help() {
     cat <<EOF
 Uso: $0 <comando> [args...]
 
 Comandos:
-  prepare          - Prepara montagens do chroot (proc, sys, dev, binds, resolv.conf).
-  shell [user]     - Prepara e entra em shell interativa dentro do chroot (default: ${CHROOT_DEFAULT_USER}).
+  prepare                    - Prepara montagens do chroot (proc, sys, dev, binds, resolv.conf).
+  shell [USER]               - Prepara e entra em shell interativa dentro do chroot (default: ${CHROOT_DEFAULT_USER}).
+  run [-u USER] <cmd...>     - Prepara e executa um comando dentro do chroot (default: root).
+  stop                       - Desmonta todas as montagens do chroot e remove lock.
+  status                     - Mostra status de montagens, bind-mounts e lock.
+  help                       - Mostra este help.
+
+Configuração:
+  Todas as variáveis de configuração estão no topo do script (CHROOT_ROOT, CHROOT_NAME, etc.).
+EOF
+}
+).
   run <cmd...>     - Prepara e executa um comando dentro do chroot.
   stop             - Desmonta todas as montagens do chroot e remove lock.
   status           - Mostra status de montagens, bind-mounts e lock.
@@ -406,7 +535,7 @@ Exemplos:
   sudo $0 shell
 
   # Executar comando dentro do chroot:
-  sudo $0 run apt-get update
+  sudo $0 run mbuild sync
 
   # Ver status:
   sudo $0 status
@@ -426,10 +555,17 @@ main() {
         exit 1
     fi
 
+    require_root
+    ensure_dirs
+    check_requirements
+    sanity_check_root
+
     local cmd="$1"; shift || true
 
     case "$cmd" in
         prepare)
+            # prepare não é efêmero: deixa montagens ativas até 'stop'
+            CHROOT_EPHEMERAL=0
             cmd_prepare "$@"
             ;;
         shell)
@@ -452,5 +588,6 @@ main() {
             ;;
     esac
 }
+
 
 main "$@"
