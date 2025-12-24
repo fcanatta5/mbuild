@@ -138,11 +138,20 @@ safe_touch() {
     fi
 }
 
-compute_sha256() {
-    # compute_sha256 FILE
+sha256_sum_internal() {
+    # sha256_sum_internal FILE
     require_cmd sha256sum
     local file="$1"
+    if [ ! -f "$file" ]; then
+        die 1 "File not found for checksum: $file"
+    fi
     sha256sum "$file" 2>/dev/null | awk '{print $1}'
+}
+
+compute_sha256() {
+    # compute_sha256 FILE
+    local file="$1"
+    sha256_sum_internal "$file"
 }
 
 verify_sha256() {
@@ -150,13 +159,10 @@ verify_sha256() {
     local file="$1"
     local expected="$2"
     if [ -z "$expected" ]; then
-        die 1 "Empty checksum passed to verify_sha256."
-    fi
-    if [ ! -f "$file" ]; then
-        die 1 "File not found for checksum verification: $file"
+        die 1 "Empty expected checksum for $file"
     fi
     local got
-    got="$(compute_sha256 "$file")"
+    got="$(sha256_sum_internal "$file")"
     if [ "$got" != "$expected" ]; then
         die 1 "Checksum mismatch for $file: expected $expected, got $got"
     fi
@@ -647,10 +653,13 @@ build_from_pkg_metadata() {
     if [ -n "${source_subdir:-}" ] && [ -d "$build_dir/$source_subdir" ]; then
         workdir="$build_dir/$source_subdir"
     else
-        local src_subdir
-        src_subdir="$(tar -tf "$tarball_path" 2>/dev/null | head -n1 | cut -d/ -f1 || true)"
-        if [ -n "$src_subdir" ] && [ -d "$build_dir/$src_subdir" ]; then
-            workdir="$build_dir/$src_subdir"
+        local topdirs first_dir
+        topdirs="$(tar -tf "$tarball_path" 2>/dev/null | awk -F/ 'NF>1 {print $1}' | sort -u || true)"
+        if [ -n "$topdirs" ]; then
+            first_dir="$(printf '%s\n' "$topdirs" | head -n1)"
+            if [ -n "$first_dir" ] && [ -d "$build_dir/$first_dir" ]; then
+                workdir="$build_dir/$first_dir"
+            fi
         fi
     fi
 
@@ -676,14 +685,13 @@ build_from_pkg_metadata() {
                 style_custom_build "$category" "$name" "$workdir" "$build_dir" "$destdir"
                 ;;
             *)
-                echo "Unknown style: $style"
-                exit 1
+                die 1 "Unknown style: $style"
                 ;;
         esac
 
     } >>"$build_log" 2>&1 || {
         log "ERROR" "Build failed for ${name}-${version}. See log: ${build_log}"
-        exit 1
+        die 1 "Build failed for ${name}-${version}. See log: ${build_log}"
     }
 
     overlay_recipe_files_into_destdir "$category" "$name" "$destdir"
@@ -739,6 +747,149 @@ install_from_destdir() {
 }
 
 # =========================
+# Dependency resolution (build_deps / run_deps)
+# =========================
+
+# Dependency specification syntax in pkgfiles:
+#   build_deps="foo bar baz/qux"
+#   run_deps="lib1 othercat/lib2"
+#
+# Each token is either:
+#   name           -> same category as the depending package
+#   category/name  -> explicit category and name
+#
+# The resolver works on keys of the form "category:name" and
+# detects cycles using a depth-first search with a visitation state.
+
+parse_dep_spec() {
+    # parse_dep_spec PARENT_CATEGORY SPEC
+    # Sets global variables dep_category and dep_name.
+    local parent_category="$1"
+    local spec="$2"
+    if [[ "$spec" == */* ]]; then
+        dep_category="${spec%%/*}"
+        dep_name="${spec##*/}"
+    else
+        dep_category="$parent_category"
+        dep_name="$spec"
+    fi
+}
+
+dep_key() {
+    # dep_key CATEGORY NAME
+    printf '%s:%s' "$1" "$2"
+}
+
+is_package_installed() {
+    # is_package_installed NAME
+    local name="$1"
+    local meta
+    meta="$(pkg_meta_path "$name")"
+    if [ -f "$meta" ]; then
+        return 0
+    fi
+    return 1
+}
+
+resolve_deps_dfs() {
+    # resolve_deps_dfs CATEGORY NAME MODE
+    # MODE: build | run | both
+    local category="$1"
+    local name="$2"
+    local mode="$3"
+
+    # Bash associative arrays for visitation state and ordering.
+    # State: 0=unvisited, 1=visiting, 2=done
+    local key
+    key="$(dep_key "$category" "$name")"
+
+    # shellcheck disable=SC2154
+    local state="${MBUILD_DEP_STATE[$key]:-0}"
+    case "$state" in
+        1)
+            die 1 "Dependency cycle detected involving package '$category/$name'"
+            ;;
+        2)
+            return 0
+            ;;
+    esac
+
+    MBUILD_DEP_STATE["$key"]=1
+
+    # Load this pkgfile to read its dependency fields.
+    load_pkgfile "$category" "$name"
+
+    local deps=""
+    case "$mode" in
+        build)
+            deps="$build_deps"
+            ;;
+        run)
+            deps="$run_deps"
+            ;;
+        both|*)
+            deps="$build_deps $run_deps"
+            ;;
+    esac
+
+    local dep
+    for dep in $deps; do
+        [ -z "$dep" ] && continue
+        parse_dep_spec "$category" "$dep"
+        resolve_deps_dfs "$dep_category" "$dep_name" "$mode"
+    done
+
+    MBUILD_DEP_STATE["$key"]=2
+    MBUILD_DEP_ORDER+=("$category/$name")
+}
+
+resolve_dependencies() {
+    # resolve_dependencies CATEGORY NAME MODE
+    # Produces a topologically sorted list in MBUILD_DEP_ORDER
+    # (including the root package as the last element).
+    local category="$1"
+    local name="$2"
+    local mode="$3"
+
+    # Declare/reset globals
+    # shellcheck disable=SC2034
+    declare -gA MBUILD_DEP_STATE=()
+    # shellcheck disable=SC2034
+    declare -ga MBUILD_DEP_ORDER=()
+
+    resolve_deps_dfs "$category" "$name" "$mode"
+}
+
+install_dependencies_for_package() {
+    # install_dependencies_for_package CATEGORY NAME MODE
+    # MODE: build | run | both
+    local category="$1"
+    local name="$2"
+    local mode="$3"
+
+    resolve_dependencies "$category" "$name" "$mode"
+
+    local entry dep_category dep_name
+    for entry in "${MBUILD_DEP_ORDER[@]}"; do
+        # Skip the root package itself; it is handled by the caller.
+        if [ "$entry" = "$category/$name" ]; then
+            continue
+        fi
+        dep_category="${entry%%/*}"
+        dep_name="${entry##*/}"
+
+        if is_package_installed "$dep_name"; then
+            log "DEBUG" "Dependency ${dep_category}/${dep_name} already installed; skipping."
+            continue
+        fi
+
+        log "INFO" "Installing dependency ${dep_category}/${dep_name} (mode=${mode})"
+        # Call the internal installer that does not recurse on dependencies again.
+        cmd_install_internal "$dep_category" "$dep_name" "" "skip-deps"
+    done
+}
+
+# =========================
 # Commands
 # =========================
 
@@ -759,7 +910,7 @@ cmd_build_only() {
     ensure_dirs
     check_core_tools
 
-    if [ "$#" < 3 ] || [ "$#" -gt 4 ]; then
+    if [ "$#" -lt 3 ] || [ "$#" -gt 4 ]; then
         die 1 "Usage: mbuild build <category> <name> <version> [tarball-path]"
     fi
 
@@ -770,6 +921,7 @@ cmd_build_only() {
 
     load_pkgfile "$category" "$name"
     version="$version_arg"
+    install_dependencies_for_package "$category" "$name" "build"
 
     if [ -z "$tarball_path" ]; then
         local tarball
@@ -786,26 +938,28 @@ cmd_build_only() {
     log "INFO" "Build-only finished. Destdir at: $destdir"
 }
 
-cmd_install() {
-    # mbuild install <category> <name> [version]
+cmd_install_internal() {
+    # cmd_install_internal CATEGORY NAME [VERSION_OVERRIDE] [DEPS_MODE]
+    # DEPS_MODE: with-deps | skip-deps
+    local category="$1"
+    local name="$2"
+    local version_override="${3:-}"
+    local deps_mode="${4:-with-deps}"
+
     ensure_root
     load_config
     check_arch
     ensure_dirs
     check_core_tools
 
-    if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-        die 1 "Usage: mbuild install <category> <name> [version]"
-    fi
-
-    local category="$1"
-    local name="$2"
-    local version_override="${3:-}"
-
     load_pkgfile "$category" "$name"
 
     if [ -n "$version_override" ]; then
         version="$version_override"
+    fi
+
+    if [ "$deps_mode" != "skip-deps" ]; then
+        install_dependencies_for_package "$category" "$name" "both"
     fi
 
     local tarball
@@ -825,6 +979,19 @@ cmd_install() {
     build_from_pkg_metadata "$category" "$name" "$tarball_path" "$destdir" "$build_log"
     install_from_destdir "$name" "$version" "$destdir" "$files_list"
     pkg_record "$name" "$version" "$category" "$tarball_path" "$sha256" "$build_log" "$destdir" "$files_list" "$pkgfile"
+}
+
+cmd_install() {
+    # mbuild install <category> <name> [version]
+    if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
+        die 1 "Usage: mbuild install <category> <name> [version]"
+    fi
+
+    local category="$1"
+    local name="$2"
+    local version_override="${3:-}"
+
+    cmd_install_internal "$category" "$name" "$version_override" "with-deps"
 }
 
 cmd_list() {
