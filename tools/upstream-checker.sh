@@ -9,6 +9,12 @@
 #   - notify-send (opcional, para notificações gráficas)
 #
 
+# Verificação de versão mínima do bash (requer bash >= 4)
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "Este script requer bash >= 4.x" >&2
+    exit 1
+fi
+
 set -euo pipefail
 IFS=$'\n\t'
 
@@ -17,25 +23,20 @@ IFS=$'\n\t'
 ########################################
 
 # Diretório do seu repositório local de programas (tarballs/tar.gz/tar.xz, etc)
-REPO_DIR="/caminho/para/seu/repositorio"
-
+REPO_DIR="${REPO_DIR:-/caminho/para/seu/repositorio}"
 # Padrão de arquivos considerados "pacotes"
 # Ex.: foo-1.2.3.tar.gz, bar-0.9.tar.xz, etc.
-REPO_GLOB_PATTERN="*.tar.*"
-
+REPO_GLOB_PATTERN="${REPO_GLOB_PATTERN:-*.tar.*}"
 # Diretório de trabalho/cache para listas e logs temporários
-CACHE_DIR="/tmp/upstream-checker"
-
+CACHE_DIR="${CACHE_DIR:-/tmp/upstream-checker}"
 # Comando de notificação (se existir).
 # notify-send é padrão em desktops Linux com libnotify.
 NOTIFY_SEND_BIN="${NOTIFY_SEND_BIN:-notify-send}"
 
 # Timeout (segundos) para requisições HTTP/HTTPS/FTP
-NET_TIMEOUT=10
-
+NET_TIMEOUT="${NET_TIMEOUT:-10}"
 # Verbosidade: 0 = só erros, 1 = +infos, 2 = debug verboso
-VERBOSE_LEVEL=1
-
+VERBOSE_LEVEL="${VERBOSE_LEVEL:-1}"
 ########################################
 # MAPEAMENTO DE PROGRAMAS -> UPSTREAM
 #
@@ -239,6 +240,94 @@ extract_name_version_from_file() {
 # Heurística: procurar arquivos/tag contendo "name-" + versão
 # e extrair versões por regex.
 
+# Escapa caracteres especiais para uso em expressões regulares do grep/sed
+regex_escape() {
+    printf '%s\n' "$1" | sed -E 's/[][\.^$|?*+(){}]/\\&/g'
+}
+
+# Codifica uma string para uso em URLs (percent-encoding mínimo)
+url_encode() {
+    local str="$1"
+    local i c
+    for ((i=0; i<${#str}; i++)); do
+        c="${str:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) printf '%s' "$c" ;;
+            *) printf '%%%02X' "'$c" ;;
+        esac
+    done
+}
+
+# Wrapper para chamadas à API do GitHub (ou GitHub Enterprise)
+github_api_get() {
+    local path="$1"
+    local url_base
+    local cmd
+    cmd="$(download_cmd)"
+
+    # Se GITHUB_API_BASE não for definido, usar api.github.com para github.com
+    # ou tentar /api/v3 no host original (GitHub Enterprise)
+    if [ -n "${GITHUB_API_BASE:-}" ]; then
+        url_base="${GITHUB_API_BASE%/}"
+    else
+        # fallback razoável
+        url_base="https://api.github.com"
+    fi
+
+    local url="${url_base}/${path#/}"
+
+    if [ "$cmd" = "curl" ]; then
+        if [ -n "${GITHUB_API_TOKEN:-}" ]; then
+            curl -fsSL --max-time "$NET_TIMEOUT" \
+                -H "Accept: application/vnd.github+json" \
+                -H "Authorization: Bearer $GITHUB_API_TOKEN" \
+                "$url"
+        else
+            curl -fsSL --max-time "$NET_TIMEOUT" \
+                -H "Accept: application/vnd.github+json" \
+                "$url"
+        fi
+    else
+        if [ -n "${GITHUB_API_TOKEN:-}" ]; then
+            wget -q -O - --timeout="$NET_TIMEOUT" \
+                --header="Accept: application/vnd.github+json" \
+                --header="Authorization: Bearer $GITHUB_API_TOKEN" \
+                "$url"
+        else
+            wget -q -O - --timeout="$NET_TIMEOUT" \
+                --header="Accept: application/vnd.github+json" \
+                "$url"
+        fi
+    fi
+}
+
+# Wrapper para chamadas à API do GitLab (inclui GitLab self-hosted)
+gitlab_api_get() {
+    local api_url="$1"
+    local cmd
+    cmd="$(download_cmd)"
+
+    if [ "$cmd" = "curl" ]; then
+        if [ -n "${GITLAB_API_TOKEN:-}" ]; then
+            curl -fsSL --max-time "$NET_TIMEOUT" \
+                -H "PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                "$api_url"
+        else
+            curl -fsSL --max-time "$NET_TIMEOUT" "$api_url"
+        fi
+    else
+        if [ -n "${GITLAB_API_TOKEN:-}" ]; then
+            wget -q -O - --timeout="$NET_TIMEOUT" \
+                --header="PRIVATE-TOKEN: $GITLAB_API_TOKEN" \
+                "$api_url"
+        else
+            wget -q -O - --timeout="$NET_TIMEOUT" "$api_url"
+        fi
+    fi
+}
+
+
+
 extract_versions_from_listing() {
     local name="$1"
     # lê HTML/listagem da stdin
@@ -272,38 +361,65 @@ get_upstream_version_httpdir() {
 
 get_upstream_version_github() {
     local name="$1" url="$2"
-    # Exemplo de url: https://github.com/user/proj
-    # Estratégia:
-    #   1) tentar releases/latest (HTML) -> pega "releases/tag/<tag>"
-    #   2) fallback: /tags
 
-    local base="$url"
-    local html tag_line tag version
+    # Extrair owner/repo da URL
+    # Suporta formatos tipo:
+    #   https://github.com/owner/repo
+    #   https://github.com/owner/repo.git
+    #   https://github.com/owner/repo/algum/caminho
+    local rest owner repo tmp
+    rest="${url#*://}"        # remove esquema
+    rest="${rest#*/}"         # remove host
+    rest="${rest%%\?*}"
+    rest="${rest%%\#*}"
+    rest="${rest%.git}"
+    rest="${rest%/}"
 
-    # Tentativa: /releases/latest
-    html="$(fetch_url "${base}/releases/latest" || true)"
-    if [ -n "$html" ]; then
-        tag_line="$(printf '%s\n' "$html" | grep -Eo 'releases/tag/[^"]+' | head -n1 || true)"
-        if [ -n "$tag_line" ]; then
-            tag="${tag_line##*/}"   # último segmento da URL
-            version="${tag#v}"      # remove v inicial, se tiver
-            if [ -n "$version" ]; then
-                printf '%s\n' "$version"
-                return 0
-            fi
+    owner="${rest%%/*}"
+    tmp="${rest#*/}"
+    repo="${tmp%%/*}"
+
+    if [ -z "$owner" ] || [ -z "$repo" ] || [ "$owner" = "$rest" ]; then
+        log "WARN" "URL de GitHub inválida '$url' para $name"
+        return 1
+    fi
+
+    # Se GITHUB_API_BASE não for definido e URL for github.com, usar api.github.com
+    # Caso contrário, respeitar GITHUB_API_BASE (para GitHub Enterprise).
+    if [ -z "${GITHUB_API_BASE:-}" ]; then
+        # valor padrão
+        GITHUB_API_BASE="https://api.github.com"
+    fi
+
+    local json tag version
+
+    # 1) Tentar releases/latest
+    json="$(github_api_get "/repos/${owner}/${repo}/releases/latest" || true)"
+    if [ -n "$json" ] && printf '%s\n' "$json" | grep -q '"tag_name"'; then
+        tag="$(
+            printf '%s\n' "$json" \
+                | grep -E '"tag_name"[[:space:]]*:' \
+                | head -n1 \
+                | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
+        )"
+        tag="${tag#v}"
+        tag="${tag#V}"
+        version="$tag"
+        if [ -n "$version" ]; then
+            printf '%s\n' "$version"
+            return 0
         fi
     fi
 
-    # Fallback: /tags (HTML simples)
-    html="$(fetch_url "${base}/tags" || true)"
-    if [ -n "$html" ]; then
-        # pega tags com padrão "refs/tags/<tag>" ou "tags/<tag>"
+    # 2) Fallback: listar tags e pegar a maior que pareça versão
+    json="$(github_api_get "/repos/${owner}/${repo}/tags?per_page=100" || true)"
+    if [ -n "$json" ]; then
         version="$(
-            printf '%s\n' "$html" \
-            | grep -Eo 'tags/[vV]?[0-9][0-9A-Za-z\.\-\+~:]+' \
-            | sed -E 's#.*/##' \
-            | sed -E 's/^[vV]//' \
-            | version_max_list || true
+            printf '%s\n' "$json" \
+                | grep -E '"name"[[:space:]]*:[[:space:]]*"[vV]?[0-9][0-9A-Za-z\.\-\+~:]+"' \
+                | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([vV]?[0-9][0-9A-Za-z\.\-\+~:]*)".*/\1/' \
+                | sed -E 's/^[vV]//' \
+                | version_max_list || true
         )"
         if [ -n "$version" ]; then
             printf '%s\n' "$version"
@@ -311,32 +427,86 @@ get_upstream_version_github() {
         fi
     fi
 
-    log "WARN" "Não consegui descobrir versão upstream no GitHub para $name em $url"
+    log "WARN" "Não consegui descobrir versão upstream no GitHub via API para $name em $url"
     return 1
 }
+
 
 get_upstream_version_gitlab() {
     local name="$1" url="$2"
-    # Exemplo: https://gitlab.com/usuario/projeto
-    # Tentar HTML de /-/tags
-    local html version
-    html="$(fetch_url "${url}/-/tags" || true)"
-    if [ -n "$html" ]; then
+
+    # Extrair caminho do projeto a partir da URL:
+    #   https://gitlab.com/grupo/subgrupo/projeto
+    #   https://gitlab.seudominio.tld/grupo/projeto
+    local rest host path scheme api_base project_path project_id
+    case "$url" in
+        https://*) scheme="https://" ;;
+        http://*)  scheme="http://" ;;
+        *)         scheme="" ;;
+    esac
+
+    rest="${url#*://}"          # host/path
+    host="${rest%%/*}"          # host
+    path="${rest#*/}"           # path completo
+    path="${path%%\?*}"
+    path="${path%%\#*}"
+    path="${path%%/-/*}"        # remover possíveis sufixos /-/...
+    path="${path%.git}"
+    path="${path%/}"
+
+    if [ -z "$host" ] || [ -z "$path" ] || [ "$host" = "$rest" ]; then
+        log "WARN" "URL de GitLab inválida '$url' para $name"
+        return 1
+    fi
+
+    project_path="$path"
+    project_id="$(url_encode "$project_path")"
+
+    # Base da API: se GITLAB_API_BASE não for definido, usar host da URL
+    if [ -n "${GITLAB_API_BASE:-}" ]; then
+        api_base="${GITLAB_API_BASE%/}"
+    else
+        api_base="${scheme}${host}/api/v4"
+    fi
+
+    local json version
+
+    # 1) Tentar releases oficiais do GitLab
+    json="$(gitlab_api_get "${api_base}/projects/${project_id}/releases" || true)"
+    if [ -n "$json" ]; then
         version="$(
-            printf '%s\n' "$html" \
-            | grep -Eo '/tags/[vV]?[0-9][0-9A-Za-z\.\-\+~:]+' \
-            | sed -E 's#.*/##' \
-            | sed -E 's/^[vV]//' \
-            | version_max_list || true
+            printf '%s\n' "$json" \
+                | grep -E '"tag_name"[[:space:]]*:[[:space:]]*"[vV]?[0-9][0-9A-Za-z\.\-\+~:]+"' \
+                | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([vV]?[0-9][0-9A-Za-z\.\-\+~:]*)".*/\1/' \
+                | sed -E 's/^[vV]//' \
+                | version_max_list || true
         )"
         if [ -n "$version" ]; then
             printf '%s\n' "$version"
             return 0
         fi
     fi
-    log "WARN" "Não consegui descobrir versão upstream no GitLab para $name em $url"
+
+    # 2) Fallback: tags do repositório
+    json="$(gitlab_api_get "${api_base}/projects/${project_id}/repository/tags?per_page=100" || true)"
+    if [ -n "$json" ]; then
+        version="$(
+            printf '%s\n' "$json" \
+                | grep -E '"name"[[:space:]]*:[[:space:]]*"[vV]?[0-9][0-9A-Za-z\.\-\+~:]+"' \
+                | sed -E 's/.*"name"[[:space:]]*:[[:space:]]*"([vV]?[0-9][0-9A-Za-z\.\-\+~:]*)".*/\1/' \
+                | sed -E 's/^[vV]//' \
+                | version_max_list || true
+        )"
+        if [ -n "$version" ]; then
+            printf '%s\n' "$version"
+            return 0
+        fi
+    fi
+
+    log "WARN" "Não consegui descobrir versão upstream no GitLab via API para $name em $url"
     return 1
 }
+
 
 get_upstream_version_sourceforge() {
     # Na prática, tratamos como um httpdir/HTML, como o httpdir genérico
@@ -380,25 +550,28 @@ get_upstream_version() {
 scan_local_repo() {
     local dir="$1"
     local -A best_version=()  # requer bash >= 4
-    local f nv name version
+    local f nv name version pattern
 
     shopt -s nullglob
     cd "$dir"
 
-    for f in $REPO_GLOB_PATTERN; do
-        nv="$(extract_name_version_from_file "$f" || true)" || true
-        [ -z "$nv" ] && continue
-        name="${nv%%|*}"
-        version="${nv##*|}"
+    # Permite múltiplos padrões em REPO_GLOB_PATTERN (ex.: "*.tar.* *.zip")
+    for pattern in $REPO_GLOB_PATTERN; do
+        for f in $pattern; do
+            nv="$(extract_name_version_from_file "$f" || true)" || true
+            [ -z "$nv" ] && continue
+            name="${nv%%|*}"
+            version="${nv##*|}"
 
-        if [ -z "${best_version[$name]+x}" ]; then
-            best_version["$name"]="$version"
-        else
-            # manter a maior versão local para este nome
-            if version_gt "$version" "${best_version[$name]}"; then
+            if [ -z "${best_version[$name]+x}" ]; then
                 best_version["$name"]="$version"
+            else
+                # manter a maior versão local para este nome
+                if version_gt "$version" "${best_version[$name]}"; then
+                    best_version["$name"]="$version"
+                fi
             fi
-        fi
+        done
     done
 
     # Imprimir na forma: name|local_version
